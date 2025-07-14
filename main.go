@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"runtime"
+	"sync"
 	"time"
 )
 
@@ -12,6 +13,7 @@ type BufferedWorker[T any] struct {
 	flushInterval time.Duration
 	callback      func([]T)
 	items         []T
+	itemCh        chan T
 }
 
 func NewBufferedWorker[T any](maxItems int, flushInterval time.Duration, callback func([]T)) *BufferedWorker[T] {
@@ -20,58 +22,85 @@ func NewBufferedWorker[T any](maxItems int, flushInterval time.Duration, callbac
 		flushInterval: flushInterval,
 		callback:      callback,
 		items:         make([]T, 0, maxItems),
+		itemCh:        make(chan T),
 	}
 }
 
-func (b *BufferedWorker[T]) Start(ctx context.Context) (chan<- T, <-chan struct{}){
-	itemCh := make(chan T)
-	done := make(chan struct{})
+func (b *BufferedWorker[T]) Run(ctx context.Context) error {
 	tickerCh := time.Tick(b.flushInterval)
 
-	go func() {
-		defer close(itemCh)
-		defer close(done)
-		defer fmt.Println("worker stopped")
-		for {
-			select {
-			case <-tickerCh:
-				b.flush()
-			case item := <-itemCh:
-				b.items = append(b.items, item)
-				if len(b.items) >= b.maxItems {
-					b.flush()
-				}
-			case <-ctx.Done():
-				// TODO: flush the rest
-				return
-			}
-		}
-	}()
+	var wg sync.WaitGroup
 
-	return itemCh, done
+	defer close(b.itemCh)
+	for {
+		select {
+		case <-tickerCh:
+			fmt.Println("ticker flush")
+			if len(b.items) > 0 {
+				b.flushAsync(&wg)
+			}
+		case item := <-b.itemCh:
+			b.items = append(b.items, item)
+			if len(b.items) >= b.maxItems {
+				b.flushAsync(&wg)
+				tickerCh = time.Tick(b.flushInterval)
+			}
+		case <-ctx.Done():
+			if len(b.items) > 0 {
+				b.finalFlush()
+			}
+
+			wg.Wait()
+			return ctx.Err()
+		}
+	}
 }
 
-func (b *BufferedWorker[T]) flush() {
-	b.callback(b.items)
+func (b *BufferedWorker[T]) Add(item T) {
+	fmt.Printf("adding %v\n", item)
+	b.itemCh <- item	
+}
+
+func (b *BufferedWorker[T]) flushAsync(wg *sync.WaitGroup) {
+	flushedItems := make([]T, len(b.items))
+	copy(flushedItems, b.items)
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		b.callback(flushedItems)
+	}()
+	
 	b.items = b.items[:0]
+}
+
+func (b *BufferedWorker[T]) finalFlush() {
+	fmt.Println("final flushing", b.items)
+	b.callback(b.items)
 }
 
 func main() {
 	fmt.Println("Number of Goroutines:", runtime.NumGoroutine())
-	worker := NewBufferedWorker(4, time.Second*5, func(t []int) {
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	worker := NewBufferedWorker(10, time.Second*5, func(t []int) {
+		time.Sleep(5 * time.Second)
 		fmt.Printf("Flushed %v\n", t)
 	})
 
-	ctx, cancelCtx := context.WithCancel(context.Background())
-	itemCh, done := worker.Start(ctx)
+	done := make(chan struct{})
+	errc := make(chan error, 1)
+	go func(){
+		defer close(done)
+		errc <- worker.Run(ctx)
+	}()
 
-	itemCh <- 5
-	itemCh <- 5
-	itemCh <- 5
-	itemCh <- 5
-	itemCh <- 5
+	for n := range 21 {
+		worker.Add(n)	
+	}
 
-	time.Sleep(4 * time.Second)
 	cancelCtx()
 	<-done
+
+	fmt.Println("Number of Goroutines:", runtime.NumGoroutine())
 }
