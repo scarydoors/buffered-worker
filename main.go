@@ -35,7 +35,6 @@ func (b *BufferedWorker[T]) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-tickerCh:
-			fmt.Println("ticker flush")
 			if len(b.items) > 0 {
 				b.flushAsync(&wg)
 			}
@@ -99,7 +98,10 @@ func main() {
 		worker.Add(n)	
 	}
 
+	fmt.Println("shutting down")
 	cancelCtx()
+
+	fmt.Println("waiting for worker to flush everything")
 	<-done
 
 	fmt.Println("Number of Goroutines:", runtime.NumGoroutine())
